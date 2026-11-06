@@ -231,4 +231,9 @@ data/             运行数据（不提交到 git）
 
 ## License
 
-MIT，见 [LICENSE](LICENSE)。
+GPL-3.0-or-later（GNU General Public License v3.0 或更新版本），见 [LICENSE](LICENSE)。
+
+本项目为自由软件：你可以依据自由软件基金会发布的 GNU 通用公共许可证（第 3 版或你选择的任何更新版本）条款重新分发和/或修改它。
+
+本程序基于“有用”的目的分发，但不提供任何担保，甚至不提供适销性或特定用途适用性的默示担保。详见 GNU 通用公共许可证。
+

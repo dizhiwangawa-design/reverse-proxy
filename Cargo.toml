@@ -3,7 +3,7 @@ name = "workbuddy-proxy"
 version = "0.1.0"
 edition = "2021"
 description = "OpenAI/Anthropic compatible reverse proxy for WorkBuddy with multi-account rotation"
-license = "MIT"
+license = "GPL-3.0-or-later"
 readme = "README.md"
 
 [dependencies]
