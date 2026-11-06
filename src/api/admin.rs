@@ -265,6 +265,7 @@ pub async fn info(State(state): State<SharedState>) -> Response {
         "admin_token_required": true,
         "endpoints": {
             "openai": ["/v1/models", "/v1/chat/completions"],
+            "responses": ["/v1/responses"],
             "anthropic": ["/v1/messages", "/v1/messages/count_tokens"],
         }
     }))
