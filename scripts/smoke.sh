@@ -7,6 +7,10 @@
 # The chat tests consume a small amount of upstream quota (max_tokens: 8).
 set -euo pipefail
 
+# Local checks must never go through a corporate/http proxy.
+export no_proxy="127.0.0.1,localhost${no_proxy:+,$no_proxy}"
+export NO_PROXY="$no_proxy"
+
 BASE="${BASE:-http://127.0.0.1:8317}"
 DATA_DIR="${WB_DATA_DIR:-data}"
 MODEL="${WB_SMOKE_MODEL:-auto}"
@@ -57,6 +61,27 @@ check "anthropic messages" curl -fsS --max-time 120 \
   -H "Content-Type: application/json" \
   -d "{\"model\":\"$MODEL\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with OK\"}]}" \
   "$BASE/v1/messages"
+
+responses_non_stream() {
+  curl -fsS --max-time 120 \
+    -H "Authorization: Bearer $ADMIN" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"$MODEL\",\"input\":\"Reply with OK\",\"max_output_tokens\":16}" \
+    "$BASE/v1/responses" | grep '"object":"response"' >/dev/null
+}
+
+responses_stream() {
+  # Read the whole stream: `grep -q` would close the pipe early and make curl
+  # fail with SIGPIPE under `set -o pipefail`.
+  curl -fsS -N --max-time 120 \
+    -H "Authorization: Bearer $ADMIN" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"$MODEL\",\"input\":\"Reply with OK\",\"stream\":true}" \
+    "$BASE/v1/responses" | awk '/^event: response.completed/{found=1} END{exit !found}'
+}
+
+check "responses (non-stream)" responses_non_stream
+check "responses (stream)" responses_stream
 
 if [[ "$failures" -ne 0 ]]; then
   echo
