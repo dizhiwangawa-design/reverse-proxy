@@ -4,7 +4,7 @@
 
 - 多账号池：轮询 / 最少使用 / 加权随机三种调度策略
 - 自动续期：access token 快过期时自动调用 WorkBuddy 刷新接口，失败自动冷却并换号重试
-- 双协议：`/v1/chat/completions`（OpenAI）与 `/v1/messages`（Anthropic），包含 SSE 流式转发、工具调用和图片输入
+- 多协议：`/v1/chat/completions`（OpenAI）、`/v1/responses`（OpenAI Responses / Codex CLI）与 `/v1/messages`（Anthropic），包含 SSE 流式转发、工具调用和图片输入
 - 本机会话同步：可直接导入 WorkBuddy 桌面端的登录态，并跟随桌面端刷新令牌
 - 管理台：运行概览、账号池、模型目录、接入密钥、在线调试、调用日志、设置
 - 数据本地化：状态保存在 `data/state.json`（权限 `600`），默认只监听 `127.0.0.1`
@@ -138,6 +138,38 @@ claude
 
 管理令牌本身也可作为特权 API key 使用（便于调试台直接调用），但建议给每个客户端单独创建密钥。
 
+### Responses API（Codex CLI、OpenAI Agents SDK）
+
+Codex CLI 等新客户端默认走 Responses 协议，直接用 `/v1` 作为 base URL 即可：
+
+```toml
+# ~/.codex/config.toml
+model_provider = "workbuddy"
+model = "hy4free"
+
+[model_providers.workbuddy]
+name = "WorkBuddy Proxy"
+base_url = "http://127.0.0.1:8317/v1"
+wire_api = "responses"
+env_key = "WORKBUDDY_API_KEY"
+```
+
+```bash
+export WORKBUDDY_API_KEY="sk-wb-..."
+```
+
+`POST /v1/responses` 支持：
+
+- `instructions` 与 `input`（字符串，或 `message` / `function_call` / `function_call_output` / `input_image` 等条目）→ 上游 `messages`；
+- 扁平 `tools[]` → chat `tools[]`，`tool_choice`、`parallel_tool_calls` 透传；
+- 自定义工具（`type: "custom"`，Codex 的 `apply_patch` 就是这种，载荷由 lark 语法约束）会被包装成只收一个 `input` 字符串的 function，回包时再还原成 `custom_tool_call` 条目——否则客户端只认自定义条目，会把补丁静默丢掉；
+- `max_output_tokens` → `max_tokens`，`text.format` → `response_format`；
+- 流式输出完整的 `response.*` 事件序列（`output_item.added`、`output_text.delta`、`function_call_arguments.delta`、`output_item.done`、`completed`），上游以文本形态藏在 `content` 里的工具调用会被还原成 `function_call` 条目；
+- `previous_response_id` 在同一进程内可续接上下文（最多保留 64 条；客户端自行带全量 `input` 时不依赖它）；
+- 请求带工具时，会在最后一条用户消息之后插入一段“续跑约束”系统提示：任务没做完就必须带工具调用，不要用“我正在…”顶替动作。编码代理靠“回复里有没有工具调用”判断回合是否结束，模型一旦只输出文字就会把控制权交回给人，表现为“改了一半就停”。设 `WB_RESPONSES_NUDGE=0` 可关闭该提示做对照。
+
+响应不做持久化，`GET /v1/responses/{id}` 会返回 404。
+
 ## 账号轮询与令牌刷新
 
 - **round_robin**：按顺序轮流使用可用账号；
@@ -206,11 +238,15 @@ src/
   api/
     mod.rs       Axum 路由、鉴权、静态资源
     openai.rs    OpenAI 兼容接口
+    responses.rs OpenAI Responses 兼容接口
     anthropic.rs Anthropic 兼容接口
     admin.rs     管理 API
 web/              React + Vite 管理台
+docs/             协议实现手册（docs/responses-api.md）
 data/             运行数据（不提交到 git）
 ```
+
+协议的完整实现手册（字段映射、工具桥接、事件序列、坑位清单、排障决策树、开源实现对照）见 [docs/responses-api.md](docs/responses-api.md)。
 
 ## 常见问题
 
