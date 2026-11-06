@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod anthropic;
 pub mod openai;
+pub mod responses;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
@@ -41,6 +42,11 @@ pub fn router(state: SharedState) -> Router {
         .route("/v1/models", get(openai::list_models))
         .route("/v1/models/{id}", get(openai::get_model))
         .route("/v1/chat/completions", post(openai::chat_completions))
+        .route("/v1/responses", post(responses::create))
+        .route(
+            "/v1/responses/{id}",
+            get(responses::get).delete(responses::delete),
+        )
         .route("/v1/messages", post(anthropic::messages))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
         .route("/admin/api/login", post(login))
