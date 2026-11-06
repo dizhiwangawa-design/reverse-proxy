@@ -1,4 +1,7 @@
 use crate::error::{ApiError, ApiResult};
+use crate::inband::{
+    to_openai_tool_call, TextToolCall, TextToolCallScanner,
+};
 use crate::sanitize::sanitize_chat_body;
 use crate::sse::SseBuffer;
 use crate::state::{now_ms, SharedState};
@@ -242,6 +245,12 @@ async fn chat_impl(state: SharedState, body: Value, model: String) -> ApiResult<
         let (msg, code) = crate::upstream::parse_upstream_error(StatusCode::BAD_GATEWAY, &text);
         return Err(ApiError::upstream(StatusCode::BAD_GATEWAY, msg, code));
     }
+    // Recover tool calls the upstream left as in-band text; otherwise the
+    // client sees prose and never acts.
+    let recovered = agg.recover_inband_tool_calls();
+    if recovered {
+        tracing::debug!(model = %model, "recovered in-band tool calls from upstream text");
+    }
     let usage = agg.usage.clone();
     let out = agg.into_response(&model);
     let latency = started.elapsed().as_millis() as u64;
@@ -271,6 +280,45 @@ async fn chat_impl(state: SharedState, body: Value, model: String) -> ApiResult<
     Ok(Json(out).into_response())
 }
 
+/// Build one OpenAI stream chunk from the original frame's envelope.
+///
+/// Only the first frame's `id`/`model`/`created` are reused; the delta is
+/// replaced wholesale so no upstream-specific fields leak through.
+fn frame(shell: &Value, delta: &Value) -> Value {
+    json!({
+        "id": shell.get("id").cloned().unwrap_or(Value::Null),
+        "object": "chat.completion.chunk",
+        "created": shell.get("created").cloned().unwrap_or_else(|| json!(now_ms() / 1000)),
+        "model": shell.get("model").cloned().unwrap_or(Value::Null),
+        "choices": [{ "index": 0, "delta": delta, "finish_reason": Value::Null, "logprobs": Value::Null }],
+        "usage": Value::Null,
+    })
+}
+
+/// Build the terminating chunk that carries `finish_reason`.
+fn finish_frame(shell: &Value, reason: &str) -> Value {
+    json!({
+        "id": shell.get("id").cloned().unwrap_or(Value::Null),
+        "object": "chat.completion.chunk",
+        "created": shell.get("created").cloned().unwrap_or_else(|| json!(now_ms() / 1000)),
+        "model": shell.get("model").cloned().unwrap_or(Value::Null),
+        "choices": [{ "index": 0, "delta": json!({}), "finish_reason": reason, "logprobs": Value::Null }],
+        "usage": Value::Null,
+    })
+}
+
+/// Build a terminal chunk carrying the usage report.
+fn usage_frame(shell: &Value, usage: &Value) -> Value {
+    json!({
+        "id": shell.get("id").cloned().unwrap_or(Value::Null),
+        "object": "chat.completion.chunk",
+        "created": shell.get("created").cloned().unwrap_or_else(|| json!(now_ms() / 1000)),
+        "model": shell.get("model").cloned().unwrap_or(Value::Null),
+        "choices": [],
+        "usage": usage,
+    })
+}
+
 fn openai_stream_body(
     state: SharedState,
     account: Account,
@@ -284,6 +332,15 @@ fn openai_stream_body(
         let mut usage: Option<Value> = None;
         let mut done = false;
         let mut failed: Option<String> = None;
+        // The gateway emits no structured tool calls: it hides the invocation in
+        // `content` as DSML text. Frames are therefore rewritten rather than
+        // forwarded verbatim, so markup never reaches the client and the calls
+        // are re-emitted in the shape an OpenAI client accumulates.
+        let mut scanner = TextToolCallScanner::new();
+        let mut shell: Option<Value> = None;
+        let mut recovered: Vec<TextToolCall> = Vec::new();
+        let mut upstream_finish: Option<String> = None;
+        let mut emitted_any_call = false;
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(bytes) => {
@@ -292,16 +349,64 @@ fn openai_stream_body(
                             done = true;
                             continue;
                         }
-                        if let Ok(v) = serde_json::from_str::<Value>(&data) {
-                            if let Some(msg) = stream_error_message(&v) {
-                                failed = Some(msg);
-                            }
-                            if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                                usage = Some(u.clone());
-                            }
+                        let Ok(v) = serde_json::from_str::<Value>(&data) else {
+                            continue;
+                        };
+                        if let Some(msg) = stream_error_message(&v) {
+                            let err = json!({"error": {"message": msg, "type": "upstream_error"}});
+                            failed = Some(msg);
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("data: {err}\n\n")));
+                            continue;
+                        }
+                        if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+                            usage = Some(u.clone());
+                        }
+                        if shell.is_none() {
+                            shell = Some(v.clone());
+                        }
+                        let choice = v.get("choices").and_then(|c| c.get(0));
+                        let delta = choice.and_then(|c| c.get("delta"));
+                        if let Some(fr) = choice
+                            .and_then(|c| c.get("finish_reason"))
+                            .and_then(Value::as_str)
+                            .filter(|f| !f.is_empty())
+                        {
+                            upstream_finish = Some(fr.to_string());
+                        }
+                        let Some(delta) = delta else { continue };
+                        // Pass a structured call through untouched; only the
+                        // text form needs recovery.
+                        if delta
+                            .get("tool_calls")
+                            .and_then(Value::as_array)
+                            .is_some_and(|a| !a.is_empty())
+                        {
+                            yield Ok(Bytes::from(format!("data: {}\n\n", frame(&v, delta))));
+                            continue;
+                        }
+                        // Reasoning is ordinary streamed text and is forwarded;
+                        // only `content` can carry markup.
+                        if let Some(r) = delta
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .filter(|r| !r.is_empty())
+                        {
+                            let f = json!({"reasoning_content": r});
+                            yield Ok(Bytes::from(format!("data: {}\n\n", frame(&v, &f))));
+                        }
+                        let Some(content) = delta.get("content").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        if content.is_empty() {
+                            continue;
+                        }
+                        let (visible, calls) = scanner.push(content);
+                        recovered.extend(calls);
+                        if !visible.is_empty() {
+                            let f = json!({"content": visible});
+                            yield Ok(Bytes::from(format!("data: {}\n\n", frame(&v, &f))));
                         }
                     }
-                    yield Ok::<Bytes, std::io::Error>(bytes);
                 }
                 Err(e) => {
                     failed = Some(e.to_string());
@@ -311,6 +416,38 @@ fn openai_stream_body(
                     done = true;
                     break;
                 }
+            }
+        }
+        // Flush whatever the scanner held back, then emit calls followed by the
+        // real finish reason: `stop` would tell the client the turn is over and
+        // the recovered calls would be ignored.
+        let (tail_text, tail_calls) = scanner.finish();
+        recovered.extend(tail_calls);
+        if let Some(shell) = shell.as_ref() {
+            if !tail_text.is_empty() {
+                let f = json!({"content": tail_text});
+                yield Ok(Bytes::from(format!("data: {}\n\n", frame(shell, &f))));
+            }
+            for (i, call) in recovered.iter().enumerate() {
+                let tc = to_openai_tool_call(i, call);
+                let f = json!({"tool_calls": [tc]});
+                yield Ok(Bytes::from(format!("data: {}\n\n", frame(shell, &f))));
+                emitted_any_call = true;
+            }
+            let finish = if emitted_any_call {
+                "tool_calls"
+            } else {
+                upstream_finish.as_deref().unwrap_or("stop")
+            };
+            yield Ok(Bytes::from(format!(
+                "data: {}\n\n",
+                finish_frame(shell, finish)
+            )));
+            if let Some(u) = usage.clone() {
+                yield Ok(Bytes::from(format!(
+                    "data: {}\n\n",
+                    usage_frame(shell, &u)
+                )));
             }
         }
         // Some gateways close the stream without a terminal [DONE] event.
@@ -463,6 +600,42 @@ impl ChatAggregate {
 
     pub fn has_tool_calls(&self) -> bool {
         self.tool_calls.values().any(|t| !t.name.is_empty())
+    }
+
+    /// Recover tool calls the upstream left as in-band text.
+    ///
+    /// The gateway answers `200` but emits no structured `tool_calls`; the
+    /// invocation sits inside `content` as DSML markup. Without this the client
+    /// receives prose and never acts. Text that is not markup is preserved.
+    ///
+    /// Returns whether anything was recovered, so the caller can tell a real
+    /// tool turn from a plain answer.
+    pub fn recover_inband_tool_calls(&mut self) -> bool {
+        if self.has_tool_calls() || self.content.is_empty() {
+            return false;
+        }
+        // The whole answer is already in hand, so one push plus a finish drains
+        // it without holding anything back.
+        let mut scanner = TextToolCallScanner::new();
+        let (mut visible, mut calls) = scanner.push(&self.content);
+        let (tail_text, mut tail_calls) = scanner.finish();
+        visible.push_str(&tail_text);
+        calls.append(&mut tail_calls);
+        if calls.is_empty() {
+            return false;
+        }
+        let base = self.tool_calls.len();
+        for (i, call) in calls.iter().enumerate() {
+            let slot = self.tool_calls.entry(base + i).or_default();
+            slot.id = Some(format!("call_dsml_{i}"));
+            slot.name = call.name.clone();
+            slot.arguments = call.arguments.to_string();
+        }
+        self.content = visible;
+        if self.finish_reason.as_deref().is_none_or(|f| f == "stop") {
+            self.finish_reason = Some("tool_calls".into());
+        }
+        true
     }
 
     pub fn into_response(self, requested_model: &str) -> Value {

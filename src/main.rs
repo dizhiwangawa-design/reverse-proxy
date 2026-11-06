@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod error;
+mod inband;
 mod sanitize;
 mod sse;
 mod state;
