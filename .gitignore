@@ -1,0 +1,17 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Runtime data (contains account tokens and API keys)
+/data/
+/config.toml
+
+# Web
+/web/node_modules/
+/web/dist/*.map
+
+# Logs / editor / OS files
+*.log
+.DS_Store
+.idea/
+.vscode/

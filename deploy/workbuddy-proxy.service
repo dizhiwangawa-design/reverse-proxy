@@ -1,0 +1,20 @@
+[Unit]
+Description=WorkBuddy Proxy (OpenAI / Anthropic compatible gateway)
+Documentation=file://%h/reverse-proxy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust these two lines if the project lives somewhere else.
+WorkingDirectory=%h/reverse-proxy
+ExecStart=%h/reverse-proxy/target/release/workbuddy-proxy
+Environment=RUST_LOG=workbuddy_proxy=info,tower_http=warn
+Restart=on-failure
+RestartSec=3
+# Graceful shutdown on SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

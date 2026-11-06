@@ -1,0 +1,32 @@
+[package]
+name = "workbuddy-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAI/Anthropic compatible reverse proxy for WorkBuddy with multi-account rotation"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+bytes = "1"
+futures-util = "0.3"
+mime_guess = "2"
+rand = "0.8"
+reqwest = { version = "0.12", features = ["json", "stream", "gzip", "brotli", "deflate", "native-tls"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+strip = true

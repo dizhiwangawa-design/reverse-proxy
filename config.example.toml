@@ -1,0 +1,42 @@
+# WorkBuddy Proxy 示例配置
+#
+# 复制为 config.toml 后按需修改。所有字段都是可选的；
+# 只有显式写出的 [rotation] / require_api_key 值才会覆盖管理台
+# 保存在 data/state.json 里的设置，其余字段使用内置默认值。
+#
+# 环境变量优先级高于本文件，详见 README。
+
+[server]
+bind = "127.0.0.1:8317"
+# 留空表示使用 data/admin_token.txt，文件不存在时自动生成。
+admin_token = ""
+# 取消注释可强制开启/关闭客户端密钥校验（会覆盖管理台设置）。
+# require_api_key = true
+cors_origins = ["*"]
+
+[upstream]
+endpoint = "https://copilot.tencent.com"
+timeout_secs = 600
+connect_timeout_secs = 20
+user_agent = "WorkBuddy/5.5.6 (CLI/2.137.1)"
+product_version = "5.5.6"
+# 上游渠道审批字段；默认值与 WorkBuddy 桌面端官方 CLI 构建一致。
+product_type = "WorkBuddy"
+ide_type = "WorkBuddy"
+ide_name = "WorkBuddy"
+
+[rotation]
+# 调度策略：round_robin | least_recent | weighted
+# strategy = "round_robin"
+# 单个请求最多尝试的账号数（1-20）
+# max_retries = 3
+# 上游 429 时的冷却秒数
+# cooldown_secs = 60
+# 网络错误 / 5xx 时的冷却秒数
+# failure_cooldown_secs = 15
+# 距离过期多少秒时提前刷新令牌
+# refresh_before_secs = 300
+# 是否同步桌面端刷新后的令牌
+# sync_local_auth = true
+# 本机 WorkBuddy 登录态文件
+# local_auth_path = "~/.local/share/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
