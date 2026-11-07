@@ -134,6 +134,7 @@ async fn response_impl(state: SharedState, body: Value, model: String) -> ApiRes
         .as_object()
         .ok_or_else(|| ApiError::bad_request("request body must be a JSON object"))?;
     let client_stream = obj.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let requested_effort = reasoning_effort(obj);
 
     let previous = obj
         .get("previous_response_id")
@@ -158,6 +159,13 @@ async fn response_impl(state: SharedState, body: Value, model: String) -> ApiRes
     copy_param(obj, &mut upstream_body, "top_p", "top_p");
     copy_param(obj, &mut upstream_body, "user", "user");
     copy_param(obj, &mut upstream_body, "max_output_tokens", "max_tokens");
+    // `reasoning.effort` is the only reasoning knob chat understands. Without
+    // this hop the client's "thinking level" silently collapses to the
+    // upstream default, which is how a caller can believe it enabled thinking
+    // mode while every request still asks for the cheapest dispatch.
+    if let Some(effort) = reasoning_effort(obj) {
+        upstream_body.insert("reasoning_effort".into(), Value::String(effort.to_string()));
+    }
     copy_param(
         obj,
         &mut upstream_body,
@@ -230,6 +238,7 @@ async fn response_impl(state: SharedState, body: Value, model: String) -> ApiRes
             started,
             history_prefix,
             custom_tools,
+            requested_effort,
         );
         let mut res = Response::new(body);
         res.headers_mut().insert(
@@ -316,7 +325,15 @@ async fn response_impl(state: SharedState, body: Value, model: String) -> ApiRes
         })
         .await;
 
-    let body = base_response(&response_id, &model, created, "completed", output, usage);
+    let body = base_response(
+        &response_id,
+        &model,
+        created,
+        "completed",
+        output,
+        usage,
+        requested_effort,
+    );
     Ok(Json(body).into_response())
 }
 
@@ -324,6 +341,33 @@ fn copy_param(obj: &Map<String, Value>, out: &mut Map<String, Value>, from: &str
     if let Some(v) = obj.get(from).filter(|v| !v.is_null()) {
         out.insert(to.to_string(), v.clone());
     }
+}
+
+/// Reasoning levels the chat upstream accepts.
+///
+/// `auto` is Responses/Codex's "let the server decide": it maps to no field at
+/// all rather than to a guess, because the upstream's own default is already
+/// the server deciding. Anything else outside this list is dropped instead of
+/// forwarded, so one unknown label cannot turn into an opaque upstream 400.
+const CHAT_REASONING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// `reasoning.effort` from a Responses request body, lower-cased and trimmed.
+fn reasoning_effort(obj: &Map<String, Value>) -> Option<&'static str> {
+    let raw = obj
+        .get("reasoning")?
+        .get("effort")
+        .and_then(Value::as_str)?
+        .trim();
+    let lower = raw.to_ascii_lowercase();
+    CHAT_REASONING_EFFORTS.iter().copied().find(|e| *e == lower)
+}
+
+/// What the `response.reasoning` block should echo back.
+fn reasoning_envelope(effort: Option<&str>) -> Value {
+    json!({
+        "effort": effort,
+        "summary": Value::Null,
+    })
 }
 
 /// Flatten `instructions` + `input[]` into chat `messages[]`.
@@ -951,6 +995,7 @@ fn base_response(
     status: &str,
     output: Value,
     usage: Value,
+    effort: Option<&str>,
 ) -> Value {
     json!({
         "id": id,
@@ -974,7 +1019,7 @@ fn base_response(
         "truncation": "disabled",
         "user": Value::Null,
         "metadata": {},
-        "reasoning": {"effort": Value::Null, "summary": Value::Null},
+        "reasoning": reasoning_envelope(effort),
         "text": {"format": {"type": "text"}},
     })
 }
@@ -994,6 +1039,7 @@ fn stream_body(
     started: Instant,
     history_prefix: Vec<Value>,
     custom_tools: Vec<String>,
+    requested_effort: Option<&'static str>,
 ) -> Body {
     let stream = async_stream::stream! {
         let empty_usage = map_usage(None);
@@ -1004,6 +1050,7 @@ fn stream_body(
             "in_progress",
             json!([]),
             Value::Null,
+            requested_effort,
         );
         let mut created_event = created_response.clone();
         if let Some(obj) = created_event.as_object_mut() {
@@ -1092,6 +1139,7 @@ fn stream_body(
                                     "failed",
                                     json!([]),
                                     map_usage(usage.as_ref()),
+                                    requested_effort,
                                 ),
                                 "error": {"code": "upstream_error", "message": message.clone()},
                             });
@@ -1225,6 +1273,7 @@ fn stream_body(
                                 "failed",
                                 json!([]),
                                 map_usage(usage.as_ref()),
+                                requested_effort,
                             ),
                             "error": {"code": "upstream_error", "message": message},
                         }),
@@ -1433,6 +1482,7 @@ fn stream_body(
                 "completed",
                 Value::Array(output.clone()),
                 response_usage,
+                requested_effort,
             );
             yield Ok::<Bytes, std::io::Error>(event(
                 "response.completed",
@@ -1607,6 +1657,52 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(description.contains("lark"), "{description}");
+    }
+
+    #[test]
+    fn reasoning_effort_reaches_the_chat_upstream() {
+        for (raw, expected) in [
+            ("high", Some("high")),
+            ("MAX", Some("max")),
+            (" low ", Some("low")),
+            ("auto", None),
+            ("none", None),
+            ("bogus", None),
+        ] {
+            let body = json!({"reasoning": {"effort": raw}});
+            assert_eq!(
+                reasoning_effort(body.as_object().unwrap()),
+                expected,
+                "effort {raw:?}"
+            );
+        }
+        let no_reasoning = json!({});
+        assert_eq!(reasoning_effort(no_reasoning.as_object().unwrap()), None);
+    }
+
+    #[test]
+    fn response_envelope_echoes_the_requested_effort() {
+        let body = base_response(
+            "resp_x",
+            "deepseek-v4.1-flash",
+            0,
+            "completed",
+            json!([]),
+            Value::Null,
+            Some("high"),
+        );
+        assert_eq!(body["reasoning"]["effort"], "high");
+
+        let none = base_response(
+            "resp_y",
+            "deepseek-v4.1-flash",
+            0,
+            "completed",
+            json!([]),
+            Value::Null,
+            None,
+        );
+        assert!(none["reasoning"]["effort"].is_null());
     }
 
     #[test]
