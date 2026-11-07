@@ -462,7 +462,13 @@ fn anthropic_stream_body(
             let ev = json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
-                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "output_tokens_details": {
+                        "reasoning_tokens": reasoning_tokens_of(usage.as_ref()),
+                    },
+                }
             });
             yield Ok(Bytes::from(sse_event("message_delta", &ev.to_string())));
             yield Ok(Bytes::from(sse_event("message_stop", "{\"type\":\"message_stop\"}")));
@@ -705,9 +711,16 @@ pub fn anthropic_to_openai(body: &Value) -> ApiResult<(Value, i64)> {
 /// Map Anthropic's `thinking` request block onto a chat reasoning level.
 ///
 /// Anthropic asks for a token budget, chat asks for a named level, so the
-/// budget is bucketed. `{"type": "disabled"}` means "do not think" and is left
-/// as an unset field: the upstream treats an absent `reasoning_effort` as its
-/// own default, and every model in its catalogue thinks by default.
+/// budget is bucketed onto the rungs this upstream actually honours
+/// (`low` / `high` / `max`, per the model catalogue). The buckets are handed to
+/// [`crate::api::responses::clamp_effort`] rather than spelled out here, so the
+/// two API surfaces cannot drift apart — an earlier version emitted `medium`
+/// for the middle bucket, a level the catalogue does not list.
+///
+/// `{"type": "disabled"}` is stated as `none` instead of being left unset. An
+/// absent field is *not* an off-switch here: the catalogue gives every model a
+/// `defaultEffort` and `onlyReasoning`, and the safest reading of "the caller
+/// said disabled" is to say so, not to hand the decision back to the server.
 fn reasoning_effort_from_thinking(obj: &Map<String, Value>) -> Option<&'static str> {
     let thinking = obj.get("thinking")?;
     let kind = thinking
@@ -715,17 +728,18 @@ fn reasoning_effort_from_thinking(obj: &Map<String, Value>) -> Option<&'static s
         .and_then(Value::as_str)
         .unwrap_or("enabled");
     if kind != "enabled" {
-        return None;
+        return Some(crate::api::responses::REASONING_OFF);
     }
     let budget = thinking
         .get("budget_tokens")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    Some(match budget {
+    let bucketed = match budget {
         i64::MIN..=4095 => "low",
-        4096..=16383 => "medium",
-        16384..=i64::MAX => "high",
-    })
+        4096..=16383 => "high",
+        _ => "max",
+    };
+    Some(crate::api::responses::clamp_effort(bucketed))
 }
 
 fn blocks_to_text(v: &Value) -> String {
@@ -803,8 +817,26 @@ pub fn to_anthropic_response(
         "usage": {
             "input_tokens": usage.and_then(|u| u.get("prompt_tokens")).and_then(Value::as_u64).unwrap_or(0),
             "output_tokens": usage.and_then(|u| u.get("completion_tokens")).and_then(Value::as_u64).unwrap_or(0),
+            // Anthropic's schema has no reasoning counter; the token is billed
+            // inside `output_tokens`, so without this a caller cannot tell
+            // "thought and answered" from "answered only". Kept out of the way
+            // (null when the upstream reported none) so strict clients see the
+            // shape they expect.
+            "output_tokens_details": {
+                "reasoning_tokens": reasoning_tokens_of(usage),
+            },
         }
     })
+}
+
+/// Reasoning tokens the upstream reported, if any.
+fn reasoning_tokens_of(usage: Option<&Value>) -> Value {
+    usage
+        .and_then(|u| u.get("completion_tokens_details"))
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .map(|n| json!(n))
+        .unwrap_or(Value::Null)
 }
 
 fn map_stop_reason(finish: Option<&str>, has_tools: bool) -> &'static str {
@@ -901,14 +933,16 @@ mod tests {
     }
 
     #[test]
-    fn thinking_budget_maps_to_a_chat_reasoning_level() {
+    fn thinking_budget_maps_onto_a_supported_level() {
+        // The catalogue lists `low` / `high` / `max`, so the budget buckets must
+        // land on those three — `medium` is not a level this upstream honours.
         for (budget, expected) in [
             (1024, "low"),
             (4095, "low"),
-            (4096, "medium"),
-            (8000, "medium"),
-            (16384, "high"),
-            (64000, "high"),
+            (4096, "high"),
+            (8000, "high"),
+            (16384, "max"),
+            (64000, "max"),
         ] {
             let body = json!({
                 "model": "auto",
@@ -922,7 +956,9 @@ mod tests {
     }
 
     #[test]
-    fn disabled_thinking_sends_no_reasoning_level() {
+    fn disabled_thinking_states_the_off_level() {
+        // Leaving the field unset would hand the decision to the model's
+        // `defaultEffort`, so "disabled" has to be said out loud.
         let body = json!({
             "model": "auto",
             "max_tokens": 64,
@@ -930,7 +966,10 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
         let (out, _) = anthropic_to_openai(&body).expect("convert");
-        assert!(out.get("reasoning_effort").is_none());
+        assert_eq!(
+            out["reasoning_effort"],
+            crate::api::responses::REASONING_OFF
+        );
     }
 
     #[test]
