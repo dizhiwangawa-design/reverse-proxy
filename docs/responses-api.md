@@ -1,7 +1,7 @@
 # Responses API 兼容层：实现手册
 
 > 面向本项目 `workbuddy-proxy`，但协议部分对所有「Responses 客户端 → Chat Completions 上游」的桥接都成立。
-> 代码基准：`src/api/responses.rs`（1606 行）、`src/inband.rs`、`src/api/openai.rs`；`cargo test` 81 项。
+> 代码基准：`src/api/responses.rs`（约 1800 行）、`src/api/anthropic.rs`、`src/inband.rs`、`src/api/openai.rs`；`cargo test` 88 项。
 > 参考实现对照见文末第 11 节。
 
 ---
@@ -62,7 +62,8 @@ POST /v1/responses                    responses::create                  POST /v
 | `tool_choice` | `tool_choice` | 字符串或 `{type:"function",function:{name}}` |
 | `stream` | 上游恒为 `true` | 上游只有流式实现，非流式由本层聚合 |
 | `stream_options` | **删除** | 本上游不接受该参数；它在末尾 chunk 里本来就会带 `usage`，删了不丢统计 |
-| `include` / `store` / `truncation` / `reasoning` / `metadata` | 丢弃 | 上游无对应概念；`reasoning.effort` 可映射成 `reasoning_effort`（未做） |
+| `reasoning.effort` | `reasoning_effort` | 只转发 chat 认识的档位（`minimal`/`low`/`medium`/`high`/`xhigh`/`max`，大小写不敏感）；`auto`/`none`/未知值不转发，交给上游默认。回包 `response.reasoning.effort` 原样回显请求值 |
+| `include` / `store` / `truncation` / `reasoning.summary` / `metadata` | 丢弃 | 上游无对应概念；`include: ["reasoning.encrypted_content"]` 不报错，只是不提供该字段 |
 | `previous_response_id` | 展开历史 | 见第 6 节 |
 
 ### 2.2 input item → message 的对照
@@ -283,15 +284,18 @@ response.output_item.done               (type=reasoning, summary=[{type:summary_
 
 非流式则在 `output[]` 里放 `{"id":"rs_...","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":...}]}`，位置在 message 之前。
 
-四条实现约束：
+六条实现约束：
 
 1. **`encrypted_content` 要"缺字段"而不是 `null` 或空串**。客户端看到字段存在就会在下一轮原样回传；本层 `push_input_item` 对 `reasoning` item 是丢弃的（chat 协议无处安放），于是变成"每轮回传、每轮丢弃"的假状态。
 2. **索引要整体后移**：有 reasoning 时 `text_index = 1`、工具从 2 起；没有时照旧 0/1。事件里的 `output_index` 必须与最终 `output[]` 下标一致。
 3. **只在文本之前建 reasoning item**。这些模型都是先思考后输出；若某个上游把 `reasoning_content` 混在正文之后，宁可不建 item（丢弃该 delta），也不要造出索引错乱的事件。
 4. **reasoning item 在"第一段可见正文出现时"就关闭**，不是等流结束。否则事件序列会变成 `reasoning.delta… → message.added → reasoning.done`，item 交错；虽然按 `item_id` 还能对上，但校验严格的客户端会认为 `output_item.done` 的顺序与 `output[]` 不一致。实现上是在正文分支开头补一次"关闭 reasoning"，并在收尾处兜底（只有思考、没有正文的回合）。
 5. **`include: ["reasoning.encrypted_content"]` 不返回 400**。Codex 默认就带这个字段，拒绝等于全盘失效；正确做法是"该字段不提供"，在语义上就是"我没有可交付的密文"。
+6. **`reasoning.effort` 要真的转成上游的 `reasoning_effort`**，否则客户端选择了"高"思考档，请求却是上游默认档；更糟的是模型可能压根不吐 `reasoning_content`，于是用户看到的是"开了思考模式但没有思考"。只转发 chat 认识的档位（`minimal`/`low`/`medium`/`high`/`xhigh`/`max`），`auto`/`none`/未知值不转发——一个上游不认识的标签会变成 400，比"用默认档"严重得多。回包 `response.reasoning.effort` 回显请求值（未请求则为 `null`），让客户端能确认自己拿到的是哪一档。
 
-实测（`glm-5.3`，唯一会吐 `reasoning_content` 的目录模型）：
+实测：同一个 prompt，修复前 `deepseek-v4.1-flash` 的流里没有任何 `reasoning_summary_text.delta`（`reasoning.effort: "high"` 被丢弃），修复后 reasoning item 正常出现在 `output_index: 0`，`output[0].type == "reasoning"`。
+
+实测（`glm-5.3`，目录里最早确认会吐 `reasoning_content` 的模型）：
 
 ```
 response.output_item.added          idx=0 type=reasoning  summary=[]

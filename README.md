@@ -134,7 +134,8 @@ claude
 
 - 同时支持 `Authorization: Bearer <key>` 和 `x-api-key: <key>`；
 - 支持 `/v1/messages/count_tokens`（为保证 Claude Code 的上下文统计正常工作，使用本地保守估算）；
-- 支持流式、system、图片、`tool_use` / `tool_result` 转换。
+- 支持流式、system、图片、`tool_use` / `tool_result` 转换；
+- 扩展思考：`thinking.budget_tokens` 按档位映射（<4096 → `low`，4096–16383 → `medium`，≥16384 → `high`），流式回 `thinking` 内容块 + `thinking_delta`，非流式回 `thinking` 块；`thinking.type = "disabled"` 不发送思考档位。
 
 管理令牌本身也可作为特权 API key 使用（便于调试台直接调用），但建议给每个客户端单独创建密钥。
 
@@ -163,7 +164,7 @@ export WORKBUDDY_API_KEY="sk-wb-..."
 - `instructions` 与 `input`（字符串，或 `message` / `function_call` / `function_call_output` / `input_image` 等条目）→ 上游 `messages`；
 - 扁平 `tools[]` → chat `tools[]`，`tool_choice`、`parallel_tool_calls` 透传；
 - 自定义工具（`type: "custom"`，Codex 的 `apply_patch` 就是这种，载荷由 lark 语法约束）会被包装成只收一个 `input` 字符串的 function，回包时再还原成 `custom_tool_call` 条目——否则客户端只认自定义条目，会把补丁静默丢掉；
-- `max_output_tokens` → `max_tokens`，`text.format` → `response_format`；
+- `max_output_tokens` → `max_tokens`，`text.format` → `response_format`，`reasoning.effort` → `reasoning_effort`（`auto`/未知档位不转发，回包在 `response.reasoning.effort` 回显）；
 - 流式输出完整的 `response.*` 事件序列（`output_item.added`、`output_text.delta`、`function_call_arguments.delta`、`output_item.done`、`completed`），上游以文本形态藏在 `content` 里的工具调用会被还原成 `function_call` 条目；
 - `previous_response_id` 在同一进程内可续接上下文（最多保留 64 条；客户端自行带全量 `input` 时不依赖它）；
 - 请求带工具时，会在最后一条用户消息之后插入一段“续跑约束”系统提示：任务没做完就必须带工具调用，不要用“我正在…”顶替动作。编码代理靠“回复里有没有工具调用”判断回合是否结束，模型一旦只输出文字就会把控制权交回给人，表现为“改了一半就停”。设 `WB_RESPONSES_NUDGE=0` 可关闭该提示做对照。
