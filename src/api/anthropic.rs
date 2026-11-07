@@ -249,6 +249,9 @@ fn anthropic_stream_body(
         let mut upstream = Box::pin(upstream);
         let mut text_open = false;
         let mut text_block_index: i64 = 0;
+        let mut thinking_open = false;
+        let mut thinking_block_index: i64 = 0;
+        let mut thinking_seen = false;
         let mut next_index: i64 = 0;
         let tool_blocks: BTreeMap<usize, i64> = BTreeMap::new();
         let mut open_blocks: Vec<i64> = Vec::new();
@@ -283,8 +286,51 @@ fn anthropic_stream_body(
                             }
                         }
                         let Some(delta) = choice.get("delta") else { continue };
+                        // Thinking must be a separate content block and must not
+                        // be interleaved with text: Anthropic clients dispatch on
+                        // block order, and a text block reopened after a thinking
+                        // block would break the assistant turn they replay.
+                        if let Some(r) = delta
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            if !thinking_open && !text_open {
+                                thinking_open = true;
+                                thinking_seen = true;
+                                thinking_block_index = next_index;
+                                open_blocks.push(next_index);
+                                let ev = json!({
+                                    "type": "content_block_start",
+                                    "index": next_index,
+                                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+                                });
+                                yield Ok(Bytes::from(sse_event("content_block_start", &ev.to_string())));
+                                next_index += 1;
+                            }
+                            if thinking_open {
+                                let ev = json!({
+                                    "type": "content_block_delta",
+                                    "index": thinking_block_index,
+                                    "delta": {"type": "thinking_delta", "thinking": r}
+                                });
+                                yield Ok(Bytes::from(sse_event("content_block_delta", &ev.to_string())));
+                            }
+                        }
                         if let Some(t) = delta.get("content").and_then(Value::as_str) {
                             if !t.is_empty() {
+                                // First visible text ends the thinking phase.
+                                if thinking_open {
+                                    let ev = json!({
+                                        "type": "content_block_stop",
+                                        "index": thinking_block_index
+                                    });
+                                    yield Ok(Bytes::from(sse_event("content_block_stop", &ev.to_string())));
+                                    thinking_open = false;
+                                    // Closed here, so the trailing close loop must
+                                    // not stop the same block a second time.
+                                    open_blocks.retain(|i| *i != thinking_block_index);
+                                }
                                 if !text_open {
                                     text_open = true;
                                     text_block_index = next_index;
@@ -391,10 +437,19 @@ fn anthropic_stream_body(
                     yield Ok(Bytes::from(sse_event("content_block_delta", &delta.to_string())));
                 }
             }
+            // Anthropic wants at least one content block; a thinking-only turn
+            // still needs a trailing text block, and its index must continue
+            // past the thinking block rather than reuse index 0.
             if !text_open && tool_blocks.is_empty() && !has_pending_tools {
-                let ev = json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}});
+                let bi = if thinking_seen { next_index } else { 0 };
+                let ev = json!({"type": "content_block_start", "index": bi, "content_block": {"type": "text", "text": ""}});
                 yield Ok(Bytes::from(sse_event("content_block_start", &ev.to_string())));
-                open_blocks.push(0);
+                open_blocks.push(bi);
+            }
+            if thinking_open {
+                let ev = json!({"type": "content_block_stop", "index": thinking_block_index});
+                yield Ok(Bytes::from(sse_event("content_block_stop", &ev.to_string())));
+                open_blocks.retain(|i| *i != thinking_block_index);
             }
             for idx in &open_blocks {
                 let ev = json!({"type": "content_block_stop", "index": idx});
@@ -602,6 +657,13 @@ pub fn anthropic_to_openai(body: &Value) -> ApiResult<(Value, i64)> {
     if let Some(stop) = obj.get("stop_sequences") {
         out.insert("stop".into(), stop.clone());
     }
+    // Anthropic spells the thinking budget as `thinking.budget_tokens`; the chat
+    // upstream only takes a level. Without this hop a Claude Code caller that
+    // asked for extended thinking gets the upstream default instead, which is
+    // exactly the "thinking mode is on but nothing is thought" trap.
+    if let Some(effort) = reasoning_effort_from_thinking(obj) {
+        out.insert("reasoning_effort".into(), Value::String(effort.to_string()));
+    }
     if let Some(tools) = obj.get("tools").and_then(Value::as_array) {
         let converted: Vec<Value> = tools
             .iter()
@@ -638,6 +700,32 @@ pub fn anthropic_to_openai(body: &Value) -> ApiResult<(Value, i64)> {
         );
     }
     Ok((Value::Object(out), max_tokens))
+}
+
+/// Map Anthropic's `thinking` request block onto a chat reasoning level.
+///
+/// Anthropic asks for a token budget, chat asks for a named level, so the
+/// budget is bucketed. `{"type": "disabled"}` means "do not think" and is left
+/// as an unset field: the upstream treats an absent `reasoning_effort` as its
+/// own default, and every model in its catalogue thinks by default.
+fn reasoning_effort_from_thinking(obj: &Map<String, Value>) -> Option<&'static str> {
+    let thinking = obj.get("thinking")?;
+    let kind = thinking
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("enabled");
+    if kind != "enabled" {
+        return None;
+    }
+    let budget = thinking
+        .get("budget_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    Some(match budget {
+        i64::MIN..=4095 => "low",
+        4096..=16383 => "medium",
+        16384..=i64::MAX => "high",
+    })
 }
 
 fn blocks_to_text(v: &Value) -> String {
@@ -680,6 +768,9 @@ pub fn to_anthropic_response(
     _max_tokens: i64,
 ) -> Value {
     let mut content = Vec::new();
+    if !agg.reasoning.is_empty() {
+        content.push(json!({"type": "thinking", "thinking": agg.reasoning, "signature": ""}));
+    }
     if !agg.content.is_empty() {
         content.push(json!({"type": "text", "text": agg.content}));
     }
@@ -807,6 +898,53 @@ mod tests {
             out["tool_choice"],
             json!({"type": "function", "function": {"name": "get_weather"}})
         );
+    }
+
+    #[test]
+    fn thinking_budget_maps_to_a_chat_reasoning_level() {
+        for (budget, expected) in [
+            (1024, "low"),
+            (4095, "low"),
+            (4096, "medium"),
+            (8000, "medium"),
+            (16384, "high"),
+            (64000, "high"),
+        ] {
+            let body = json!({
+                "model": "auto",
+                "max_tokens": 64000,
+                "thinking": {"type": "enabled", "budget_tokens": budget},
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            let (out, _) = anthropic_to_openai(&body).expect("convert");
+            assert_eq!(out["reasoning_effort"], expected, "budget {budget}");
+        }
+    }
+
+    #[test]
+    fn disabled_thinking_sends_no_reasoning_level() {
+        let body = json!({
+            "model": "auto",
+            "max_tokens": 64,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (out, _) = anthropic_to_openai(&body).expect("convert");
+        assert!(out.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn thinking_becomes_the_first_content_block() {
+        let agg = crate::api::openai::ChatAggregate {
+            reasoning: "先看调用链".into(),
+            content: "改好了".into(),
+            ..Default::default()
+        };
+        let out = to_anthropic_response(&agg, "deepseek-v4.1-flash", 1024);
+        let blocks = out["content"].as_array().expect("content");
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "先看调用链");
+        assert_eq!(blocks[1]["type"], "text");
     }
 
     #[test]
