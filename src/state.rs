@@ -9,7 +9,6 @@ use crate::upstream::{is_retryable, parse_upstream_error, UpstreamClient};
 use anyhow::{Context, Result};
 use axum::http::StatusCode;
 use futures_util::StreamExt;
-use rand::Rng;
 use reqwest::Response;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -450,7 +449,7 @@ impl AppState {
                 let mut pool = list;
                 while !pool.is_empty() {
                     let total: u64 = pool.iter().map(|a| a.weight.max(1) as u64).sum();
-                    let mut pick = rand::thread_rng().gen_range(0..total);
+                    let mut pick = rand::random_range(0..total);
                     let mut idx = 0;
                     for (i, a) in pool.iter().enumerate() {
                         let w = a.weight.max(1) as u64;

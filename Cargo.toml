@@ -1,30 +1,30 @@
 [package]
 name = "workbuddy-proxy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "OpenAI/Anthropic compatible reverse proxy for WorkBuddy with multi-account rotation"
 license = "GPL-3.0-or-later"
 readme = "README.md"
 
 [dependencies]
-anyhow = "1"
+anyhow = "1.0.104"
 async-stream = "0.3"
-axum = { version = "0.8", features = ["macros"] }
-base64 = "0.22"
-bytes = "1"
+axum = { version = "0.8.9", features = ["macros"] }
+base64 = "0.23"
+bytes = "1.12.1"
 futures-util = "0.3"
-mime_guess = "2"
-rand = "0.8"
-reqwest = { version = "0.12", features = ["json", "stream", "gzip", "brotli", "deflate", "native-tls"] }
-rust-embed = { version = "8", features = ["debug-embed"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-toml = "0.8"
-tower-http = { version = "0.6", features = ["cors"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
+mime_guess = "2.0.5"
+rand = "0.10.3"
+reqwest = { version = "0.13", features = ["json", "stream", "gzip", "brotli", "deflate", "native-tls"] }
+rust-embed = { version = "8.13.0", features = ["debug-embed"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.2"
+tower-http = { version = "0.7", features = ["cors"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.29.1", features = ["v4"] }
 
 [profile.release]
 opt-level = "s"
