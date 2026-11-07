@@ -1,7 +1,5 @@
 use crate::error::{ApiError, ApiResult};
-use crate::inband::{
-    to_openai_tool_call, TextToolCall, TextToolCallScanner,
-};
+use crate::inband::{to_openai_tool_call, TextToolCall, TextToolCallScanner};
 use crate::sanitize::sanitize_chat_body;
 use crate::sse::SseBuffer;
 use crate::state::{now_ms, SharedState};

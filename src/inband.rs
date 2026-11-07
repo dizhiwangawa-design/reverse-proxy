@@ -400,7 +400,11 @@ mod tests {
             let (text, calls) = scan_all(&[a, b]);
             assert_eq!(calls.len(), 1, "cut at {cut} lost the call");
             assert_eq!(calls[0].name, "bash", "cut at {cut}");
-            assert_eq!(calls[0].arguments["command"], json!("echo hi"), "cut at {cut}");
+            assert_eq!(
+                calls[0].arguments["command"],
+                json!("echo hi"),
+                "cut at {cut}"
+            );
             assert_eq!(text, "leadtail", "cut at {cut} text");
         }
     }
@@ -444,7 +448,11 @@ mod tests {
     fn truncated_block_still_yields_complete_invoke() {
         let raw = "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>\n<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke name=\"glob\">\n<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter name=\"pattern\" string=\"true\">*.rs</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter>\n</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke>";
         let (_, calls) = scan_all(&[raw]);
-        assert_eq!(calls.len(), 1, "a closed invoke must survive a missing block closer");
+        assert_eq!(
+            calls.len(),
+            1,
+            "a closed invoke must survive a missing block closer"
+        );
         assert_eq!(calls[0].name, "glob");
         assert_eq!(calls[0].arguments["pattern"], json!("*.rs"));
     }
