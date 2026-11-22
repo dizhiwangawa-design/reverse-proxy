@@ -134,7 +134,7 @@ async fn response_impl(state: SharedState, body: Value, model: String) -> ApiRes
         .as_object()
         .ok_or_else(|| ApiError::bad_request("request body must be a JSON object"))?;
     let client_stream = obj.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let requested_effort = reasoning_effort(obj);
+    let requested_effort = forwarded_effort(obj);
 
     let previous = obj
         .get("previous_response_id")
@@ -159,13 +159,28 @@ async fn response_impl(state: SharedState, body: Value, model: String) -> ApiRes
     copy_param(obj, &mut upstream_body, "top_p", "top_p");
     copy_param(obj, &mut upstream_body, "user", "user");
     copy_param(obj, &mut upstream_body, "max_output_tokens", "max_tokens");
-    // `reasoning.effort` is the only reasoning knob chat understands. Without
-    // this hop the client's "thinking level" silently collapses to the
-    // upstream default, which is how a caller can believe it enabled thinking
-    // mode while every request still asks for the cheapest dispatch.
-    if let Some(effort) = reasoning_effort(obj) {
-        upstream_body.insert("reasoning_effort".into(), Value::String(effort.to_string()));
-    }
+    // Reasoning tokens are billed against `max_tokens`, so a request that never
+    // set a budget can spend its whole allowance on thinking and return an
+    // empty message. Give the upstream a floor instead of leaving it to the
+    // model's own default, which for a thinking model is exactly where the
+    // output disappears.
+    let max_output_tokens = match upstream_body.get("max_tokens").and_then(Value::as_i64) {
+        Some(n) => n,
+        None => {
+            upstream_body.insert("max_tokens".into(), json!(DEFAULT_MAX_OUTPUT_TOKENS));
+            DEFAULT_MAX_OUTPUT_TOKENS
+        }
+    };
+    // Forward the level verbatim: the upstream distinguishes on from off
+    // (every recognised level reasons, `none` does not), but does not behave
+    // the way any single "best" level would suggest, so remapping one label to
+    // another would be this proxy guessing at the caller's intent. An absent
+    // level is still stated as `none` so "I did not ask to think" cannot drift
+    // into "the server decided to think".
+    upstream_body.insert(
+        "reasoning_effort".into(),
+        Value::String(requested_effort.to_string()),
+    );
     copy_param(
         obj,
         &mut upstream_body,
@@ -238,7 +253,8 @@ async fn response_impl(state: SharedState, body: Value, model: String) -> ApiRes
             started,
             history_prefix,
             custom_tools,
-            requested_effort,
+            Some(requested_effort),
+            Some(max_output_tokens),
         );
         let mut res = Response::new(body);
         res.headers_mut().insert(
@@ -329,10 +345,12 @@ async fn response_impl(state: SharedState, body: Value, model: String) -> ApiRes
         &response_id,
         &model,
         created,
-        "completed",
+        terminal_status(agg.finish_reason.as_deref()),
+        agg.finish_reason.as_deref(),
         output,
         usage,
-        requested_effort,
+        Some(requested_effort),
+        Some(max_output_tokens),
     );
     Ok(Json(body).into_response())
 }
@@ -343,15 +361,46 @@ fn copy_param(obj: &Map<String, Value>, out: &mut Map<String, Value>, from: &str
     }
 }
 
-/// Reasoning levels the chat upstream accepts.
+/// Reasoning levels the Responses API names, for validation only.
 ///
 /// `auto` is Responses/Codex's "let the server decide": it maps to no field at
-/// all rather than to a guess, because the upstream's own default is already
-/// the server deciding. Anything else outside this list is dropped instead of
-/// forwarded, so one unknown label cannot turn into an opaque upstream 400.
-const CHAT_REASONING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+/// all rather than to a guess. Anything else outside this list is dropped
+/// instead of forwarded, so one unknown label cannot reach the upstream.
+const RESPONSES_REASONING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// The levels this upstream actually honours, per its own model catalogue
+/// (`models[].reasoning.supportedEfforts`). Every model on the account lists
+/// exactly these three.
+///
+/// `minimal`, `medium` and `xhigh` are accepted without error but are not
+/// levels here: measured over ten samples each on one prompt, `medium` centred
+/// at 2679 reasoning tokens against `high`'s 2469 — the extra labels are not
+/// silently downgraded to a known rung, they are simply outside the ladder.
+/// Forwarding them would report depth the upstream never promised, so they are
+/// clamped onto the nearest supported rung and the clamp is echoed back.
+pub(crate) const SUPPORTED_EFFORTS: &[&str] = &["low", "high", "max"];
+
+/// The level forwarded when the caller asked for no reasoning at all.
+///
+/// An absent field and the literal `none` both spend zero reasoning tokens
+/// upstream, while any supported level spends hundreds. `none` is spelled out
+/// because "absent" has meant "the server decides" on gateways that later
+/// changed their default.
+pub(crate) const REASONING_OFF: &str = "none";
+
+/// Output budget used when the caller sent no `max_output_tokens`.
+///
+/// Reasoning tokens are drawn from the same budget, so leaving it unset lets a
+/// thinking model spend everything on reasoning and return an empty message.
+/// 8192 matches what the Responses API documents as the default.
+const DEFAULT_MAX_OUTPUT_TOKENS: i64 = 8192;
 
 /// `reasoning.effort` from a Responses request body, lower-cased and trimmed.
+///
+/// A level the upstream does not support is clamped onto the nearest rung of
+/// [`SUPPORTED_EFFORTS`] rather than dropped: dropping it would silently turn
+/// "think at medium depth" into "do not think", which is a much bigger lie than
+/// "think as hard as high".
 fn reasoning_effort(obj: &Map<String, Value>) -> Option<&'static str> {
     let raw = obj
         .get("reasoning")?
@@ -359,7 +408,37 @@ fn reasoning_effort(obj: &Map<String, Value>) -> Option<&'static str> {
         .and_then(Value::as_str)?
         .trim();
     let lower = raw.to_ascii_lowercase();
-    CHAT_REASONING_EFFORTS.iter().copied().find(|e| *e == lower)
+    let named = RESPONSES_REASONING_EFFORTS
+        .iter()
+        .copied()
+        .find(|e| *e == lower)?;
+    Some(clamp_effort(named))
+}
+
+/// Map a Responses level onto the rung this upstream honours.
+///
+/// The ladder is `low < high < max`, so an unsupported level moves up rather
+/// than down: a caller asking for more thinking should not silently receive
+/// less, and `minimal` / `medium` / `xhigh` all sit between two real rungs.
+pub(crate) fn clamp_effort(named: &'static str) -> &'static str {
+    if SUPPORTED_EFFORTS.contains(&named) {
+        return named;
+    }
+    match named {
+        "minimal" | "low" => "low",
+        "medium" | "high" => "high",
+        _ => "max",
+    }
+}
+
+/// The `reasoning_effort` actually sent upstream.
+///
+/// Unlike [`reasoning_effort`], this answers "what did we tell the upstream"
+/// for the echo, so it never returns `None`: no level, an unknown label, or
+/// `auto` all mean the caller did not ask to think, which is stated as `none`
+/// rather than left to the upstream's default.
+fn forwarded_effort(obj: &Map<String, Value>) -> &'static str {
+    reasoning_effort(obj).unwrap_or(REASONING_OFF)
 }
 
 /// What the `response.reasoning` block should echo back.
@@ -988,14 +1067,41 @@ fn output_items(reasoning: &str, content: &str, calls: &[Call]) -> Value {
     Value::Array(items)
 }
 
+/// The terminal status a chat `finish_reason` maps onto.
+///
+/// `length` is a truncation, not an answer: reporting `completed` there is how a
+/// reasoning model that burned its whole budget on thinking looks like a model
+/// that had nothing to say. `content_filter` is the other silent stop.
+fn terminal_status(finish: Option<&str>) -> &'static str {
+    match finish {
+        Some("length") | Some("content_filter") => "incomplete",
+        _ => "completed",
+    }
+}
+
+/// `incomplete_details` for a terminal status, or `null` when there is none.
+fn incomplete_details(status: &str, finish: Option<&str>) -> Value {
+    if status != "incomplete" {
+        return Value::Null;
+    }
+    let reason = match finish {
+        Some("content_filter") => "content_filter",
+        _ => "max_output_tokens",
+    };
+    json!({ "reason": reason })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn base_response(
     id: &str,
     model: &str,
     created: i64,
     status: &str,
+    finish: Option<&str>,
     output: Value,
     usage: Value,
     effort: Option<&str>,
+    max_output_tokens: Option<i64>,
 ) -> Value {
     json!({
         "id": id,
@@ -1006,9 +1112,9 @@ fn base_response(
         "output": output,
         "usage": usage,
         "error": Value::Null,
-        "incomplete_details": Value::Null,
+        "incomplete_details": incomplete_details(status, finish),
         "instructions": Value::Null,
-        "max_output_tokens": Value::Null,
+        "max_output_tokens": max_output_tokens,
         "parallel_tool_calls": true,
         "previous_response_id": Value::Null,
         "store": false,
@@ -1040,6 +1146,7 @@ fn stream_body(
     history_prefix: Vec<Value>,
     custom_tools: Vec<String>,
     requested_effort: Option<&'static str>,
+    max_output_tokens: Option<i64>,
 ) -> Body {
     let stream = async_stream::stream! {
         let empty_usage = map_usage(None);
@@ -1048,9 +1155,11 @@ fn stream_body(
             &model,
             created,
             "in_progress",
+            None,
             json!([]),
             Value::Null,
             requested_effort,
+            max_output_tokens,
         );
         let mut created_event = created_response.clone();
         if let Some(obj) = created_event.as_object_mut() {
@@ -1137,9 +1246,11 @@ fn stream_body(
                                     &model,
                                     created,
                                     "failed",
+                                    None,
                                     json!([]),
                                     map_usage(usage.as_ref()),
                                     requested_effort,
+                                    max_output_tokens,
                                 ),
                                 "error": {"code": "upstream_error", "message": message.clone()},
                             });
@@ -1271,9 +1382,11 @@ fn stream_body(
                                 &model,
                                 created,
                                 "failed",
+                                None,
                                 json!([]),
                                 map_usage(usage.as_ref()),
                                 requested_effort,
+                                max_output_tokens,
                             ),
                             "error": {"code": "upstream_error", "message": message},
                         }),
@@ -1475,18 +1588,28 @@ fn stream_body(
             } else {
                 empty_usage
             };
+            let status = terminal_status(agg.finish_reason.as_deref());
             let response = base_response(
                 &response_id,
                 &model,
                 created,
-                "completed",
+                status,
+                agg.finish_reason.as_deref(),
                 Value::Array(output.clone()),
                 response_usage,
                 requested_effort,
+                max_output_tokens,
             );
+            // A truncated turn must not be announced as `response.completed`,
+            // or SDKs report success for an answer that was cut in half.
+            let terminal_event = if status == "incomplete" {
+                "response.incomplete"
+            } else {
+                "response.completed"
+            };
             yield Ok::<Bytes, std::io::Error>(event(
-                "response.completed",
-                json!({"type": "response.completed", "response": response}),
+                terminal_event,
+                json!({"type": terminal_event, "response": response}),
             ));
 
             let mut history = history_prefix;
@@ -1660,49 +1783,134 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_reaches_the_chat_upstream() {
-        for (raw, expected) in [
-            ("high", Some("high")),
-            ("MAX", Some("max")),
-            (" low ", Some("low")),
-            ("auto", None),
-            ("none", None),
-            ("bogus", None),
+    fn supported_efforts_pass_through_and_the_rest_clamp_up() {
+        // The catalogue declares `supportedEfforts: ["low", "high", "max"]`.
+        // Those three reach the upstream untouched; the other Responses labels
+        // are clamped onto the next rung up, never silently turned into "off".
+        // An earlier revision rewrote everything except `max` to `none`, which
+        // is why `medium` used to report 0 reasoning tokens through the proxy.
+        for (raw, want) in [
+            ("low", "low"),
+            ("high", "high"),
+            ("max", "max"),
+            ("minimal", "low"),
+            ("medium", "high"),
+            ("xhigh", "max"),
         ] {
             let body = json!({"reasoning": {"effort": raw}});
             assert_eq!(
                 reasoning_effort(body.as_object().unwrap()),
-                expected,
+                Some(want),
+                "effort {raw:?} should forward as {want:?}"
+            );
+            assert_eq!(
+                forwarded_effort(body.as_object().unwrap()),
+                want,
+                "effort {raw:?}"
+            );
+        }
+        // A clamp must still think: the label the caller used is never allowed
+        // to degrade into the off-state.
+        for raw in RESPONSES_REASONING_EFFORTS {
+            let body = json!({ "reasoning": { "effort": raw } });
+            assert_ne!(
+                forwarded_effort(body.as_object().unwrap()),
+                REASONING_OFF,
+                "effort {raw:?} must not collapse to the off-state"
+            );
+        }
+        // Labels are case- and whitespace-insensitive, and the forwarded value
+        // is the canonical spelling rather than the client's.
+        for (raw, want) in [("MAX", "max"), (" Max ", "max"), (" Medium ", "high")] {
+            let body = json!({"reasoning": {"effort": raw}});
+            assert_eq!(
+                forwarded_effort(body.as_object().unwrap()),
+                want,
+                "effort {raw:?}"
+            );
+        }
+        // An unknown label and `auto` are dropped: neither means a level the
+        // upstream would understand, and in both cases the caller asked for no
+        // reasoning of its own, so the off-state is stated explicitly.
+        for raw in ["auto", "none", "bogus"] {
+            let body = json!({"reasoning": {"effort": raw}});
+            assert_eq!(
+                reasoning_effort(body.as_object().unwrap()),
+                None,
+                "effort {raw:?}"
+            );
+            assert_eq!(
+                forwarded_effort(body.as_object().unwrap()),
+                REASONING_OFF,
                 "effort {raw:?}"
             );
         }
         let no_reasoning = json!({});
         assert_eq!(reasoning_effort(no_reasoning.as_object().unwrap()), None);
+        assert_eq!(
+            forwarded_effort(no_reasoning.as_object().unwrap()),
+            REASONING_OFF
+        );
     }
 
     #[test]
-    fn response_envelope_echoes_the_requested_effort() {
+    fn response_envelope_echoes_the_forwarded_effort() {
         let body = base_response(
             "resp_x",
             "deepseek-v4.1-flash",
             0,
             "completed",
+            Some("stop"),
             json!([]),
             Value::Null,
-            Some("high"),
+            Some("medium"),
+            Some(DEFAULT_MAX_OUTPUT_TOKENS),
         );
-        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["max_output_tokens"], DEFAULT_MAX_OUTPUT_TOKENS);
+        assert!(body["incomplete_details"].is_null());
 
         let none = base_response(
             "resp_y",
             "deepseek-v4.1-flash",
             0,
             "completed",
+            None,
             json!([]),
             Value::Null,
             None,
+            None,
         );
         assert!(none["reasoning"]["effort"].is_null());
+        assert!(none["max_output_tokens"].is_null());
+    }
+
+    #[test]
+    fn a_truncated_turn_is_incomplete_not_completed() {
+        // `length` used to be reported as `completed`, which is how a model that
+        // burned its budget on thinking looked like one that said nothing.
+        assert_eq!(terminal_status(Some("length")), "incomplete");
+        assert_eq!(terminal_status(Some("content_filter")), "incomplete");
+        assert_eq!(terminal_status(Some("stop")), "completed");
+        assert_eq!(terminal_status(Some("tool_calls")), "completed");
+        assert_eq!(terminal_status(None), "completed");
+
+        assert_eq!(
+            incomplete_details("incomplete", Some("length"))["reason"],
+            "max_output_tokens"
+        );
+        assert_eq!(
+            incomplete_details("incomplete", Some("content_filter"))["reason"],
+            "content_filter"
+        );
+        // `incomplete` with no finish reason is still a token cut-off here:
+        // the only other source of `incomplete` in this layer is an upstream
+        // that stopped early.
+        assert_eq!(
+            incomplete_details("incomplete", None)["reason"],
+            "max_output_tokens"
+        );
+        assert!(incomplete_details("completed", Some("stop")).is_null());
     }
 
     #[test]
